@@ -1155,6 +1155,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 
+
+def keep_alive_worker():
+    time.sleep(15)
+    print("Keep-alive background thread started (ping every 8 minutes)")
+    while True:
+        try:
+            r = requests.get("https://git-sync-bot.onrender.com/", timeout=15)
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Keep-alive heartbeat: {r.status_code}")
+        except Exception as e:
+            print(f"Keep-alive heartbeat error: {e}")
+        time.sleep(8 * 60)
+
 def main():
 
     print("Starting GitHub Sync Bot in Webhook Mode...")
@@ -1179,6 +1191,7 @@ def main():
 
     port = int(os.environ.get("PORT", 8080))
 
+    threading.Thread(target=keep_alive_worker, daemon=True).start()
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
 
     print(f"Webhook HTTP Server listening on port {port}...")
