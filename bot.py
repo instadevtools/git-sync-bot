@@ -136,7 +136,11 @@ def parse_github_url(text):
 
         owner = match.group(1).strip()
 
-        repo = match.group(2).strip().rstrip(".git").rstrip("/").rstrip(".,;")
+        repo_raw = match.group(2).strip().rstrip("/.,; ")
+        if repo_raw.endswith(".git"):
+            repo = repo_raw[:-4]
+        else:
+            repo = repo_raw
 
         canonical_url = f"https://github.com/{owner}/{repo}"
 
