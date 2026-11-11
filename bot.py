@@ -8,11 +8,23 @@ import time
 
 import base64
 
+import shutil
+
+import tempfile
+
+import datetime
+
 import threading
+
+import subprocess
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
+
+import openpyxl
+
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 
 
@@ -320,7 +332,146 @@ def trigger_github_workflow(workflow_name="sync-and-backup.yml", inputs=None):
 
 
 
+SHEET_LOCK = threading.Lock()
+
+
+def ensure_rclone_config():
+    conf_path = os.path.expanduser("~/.config/rclone/rclone.conf")
+    if os.path.exists(conf_path) and os.path.getsize(conf_path) > 0:
+        return True
+    raw = os.getenv("RCLONE_CONFIG", "").strip()
+    if not raw:
+        return False
+    if "[gdrive]" not in raw:
+        try:
+            raw = base64.b64decode(raw).decode("utf-8")
+        except Exception:
+            pass
+    os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+    with open(conf_path, "w", encoding="utf-8") as f:
+        f.write(raw + "\n")
+    os.chmod(conf_path, 0o600)
+    return True
+
+
+def _apply_sheet_styles(ws):
+    header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_side = Side(border_style="thin", color="E2E8F0")
+    border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    headers = ["# S.No", "Repository Name", "Original GitHub Link", "Private Mirror Link", "Google Drive Backup Status", "Last Synced Date"]
+    ws.row_dimensions[1].height = 40
+    for c_idx, h_val in enumerate(headers, start=1):
+        hc = ws.cell(1, c_idx, h_val)
+        hc.fill = header_fill
+        hc.font = header_font
+        hc.alignment = header_align
+        hc.border = border
+
+    link_font = Font(name="Arial", size=10, color="1155CC", underline="single")
+    text_font = Font(name="Arial", size=10, color="000000")
+    bold_font = Font(name="Arial", size=10, bold=True, color="000000")
+    white_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+    zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+
+    for r in range(2, ws.max_row + 1):
+        ws.row_dimensions[r].height = 32
+        fill = white_fill if (r % 2 == 0) else zebra_fill
+        ws.cell(r, 1).value = r - 1
+        col_styles = [
+            (bold_font, Alignment(horizontal="center", vertical="center"), False),
+            (bold_font, Alignment(horizontal="left", vertical="center"), False),
+            (link_font, Alignment(horizontal="left", vertical="center"), True),
+            (link_font, Alignment(horizontal="left", vertical="center"), True),
+            (text_font, Alignment(horizontal="left", vertical="center"), False),
+            (text_font, Alignment(horizontal="center", vertical="center"), False),
+        ]
+        for c_idx, (fnt, aln, is_link) in enumerate(col_styles, start=1):
+            cell = ws.cell(r, c_idx)
+            cell.font = fnt
+            cell.alignment = aln
+            cell.fill = fill
+            cell.border = border
+            val = str(cell.value or "").strip()
+            if is_link and val.startswith("http"):
+                cell.hyperlink = val
+
+    for col_let, width in [("A", 10), ("B", 28), ("C", 50), ("D", 52), ("E", 46), ("F", 20)]:
+        ws.column_dimensions[col_let].width = width
+    ws.freeze_panes = "A2"
+
+
+def sync_sheet_via_rclone(repo_name, original_link, private_mirror, drive_status, action=None):
+    if not ensure_rclone_config():
+        return None
+    ist_now = (datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M")
+    with SHEET_LOCK:
+        tmp_dir = tempfile.mkdtemp(prefix="gsheet_")
+        try:
+            dl = subprocess.run(["rclone", "copy", "gdrive:GitHub Repos Backup Hub.xlsx", tmp_dir], capture_output=True, text=True, timeout=45)
+            xlsx_path = os.path.join(tmp_dir, "GitHub Repos Backup Hub.xlsx")
+            if dl.returncode != 0 or not os.path.exists(xlsx_path):
+                print(f"rclone sheet download failed: {dl.stderr[:200]}", flush=True)
+                return None
+
+            wb = openpyxl.load_workbook(xlsx_path)
+            ws = wb.active
+            clean_rows = []
+            if action != "clean_all":
+                seen = set()
+                target_idx = -1
+                for r in range(2, ws.max_row + 1):
+                    rn = str(ws.cell(r, 2).value or "").strip()
+                    if not rn or rn.lower() in seen:
+                        continue
+                    seen.add(rn.lower())
+                    orig = str(ws.cell(r, 3).value or "").strip()
+                    mir = str(ws.cell(r, 4).value or "").strip()
+                    st = str(ws.cell(r, 5).value or "").strip()
+                    dt_v = ws.cell(r, 6).value
+                    dt_s = dt_v.strftime("%Y-%m-%d %H:%M") if isinstance(dt_v, datetime.datetime) else str(dt_v or "").strip()
+                    if rn.lower() == repo_name.strip().lower():
+                        target_idx = len(clean_rows)
+                    clean_rows.append([rn, orig, mir, st, dt_s])
+
+                if repo_name:
+                    new_entry = [repo_name, original_link, private_mirror, drive_status, ist_now]
+                    if target_idx >= 0:
+                        clean_rows[target_idx] = new_entry
+                    else:
+                        clean_rows.append(new_entry)
+
+            out_wb = openpyxl.Workbook()
+            out_ws = out_wb.active
+            out_ws.title = "Backup Catalog"
+            out_ws.append(["# S.No", "Repository Name", "Original GitHub Link", "Private Mirror Link", "Google Drive Backup Status", "Last Synced Date"])
+            for i, row_vals in enumerate(clean_rows, start=1):
+                out_ws.append([i] + row_vals)
+            _apply_sheet_styles(out_ws)
+            out_wb.save(xlsx_path)
+
+            up = subprocess.run(["rclone", "copy", xlsx_path, "gdrive:", "--drive-import-formats", "xlsx"], capture_output=True, text=True, timeout=45)
+            if up.returncode == 0:
+                print(f"Formatted Google Sheet synced via rclone for {repo_name or action}!", flush=True)
+                return {"status": "success", "method": "rclone_xlsx"}
+            print(f"rclone sheet upload failed: {up.stderr[:200]}", flush=True)
+            return None
+        except Exception as e:
+            print(f"sync_sheet_via_rclone error: {e}", flush=True)
+            return None
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def log_to_google_sheet(repo_name, original_link, private_mirror, drive_status, action=None):
+
+    rclone_res = sync_sheet_via_rclone(repo_name, original_link, private_mirror, drive_status, action=action)
+
+    if rclone_res:
+
+        return rclone_res
 
     if not WEBHOOK_URL:
 
