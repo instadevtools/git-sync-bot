@@ -398,7 +398,7 @@ def _apply_sheet_styles(ws):
             if is_link and val.startswith("http"):
                 cell.hyperlink = val
 
-    for col_let, width in [("A", 10), ("B", 28), ("C", 50), ("D", 52), ("E", 46), ("F", 20)]:
+    for col_let, width in [("A", 10), ("B", 28), ("C", 50), ("D", 52), ("E", 54), ("F", 20)]:
         ws.column_dimensions[col_let].width = width
     ws.freeze_panes = "A2"
 
