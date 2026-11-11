@@ -298,9 +298,25 @@ def trigger_github_workflow(workflow_name="sync-and-backup.yml", inputs=None):
 
         payload["inputs"] = inputs
 
-    r = requests.post(url, headers=headers, json=payload)
+    for attempt in range(3):
 
-    return r.status_code == 204
+        try:
+
+            r = requests.post(url, headers=headers, json=payload, timeout=15)
+
+            print(f"Workflow dispatch ({workflow_name}) attempt {attempt + 1}: {r.status_code} {r.text[:150]}", flush=True)
+
+            if r.status_code == 204:
+
+                return True
+
+        except Exception as e:
+
+            print(f"Workflow dispatch error attempt {attempt + 1}: {e}", flush=True)
+
+        time.sleep(2)
+
+    return False
 
 
 
@@ -951,7 +967,7 @@ def process_message(message):
 
     wf_success = trigger_github_workflow("sync-and-backup.yml")
 
-    drive_status = f"Mirrored & Sync Active (GitBackups/{drive_folder}/)"
+    drive_status = f"Mirrored & Sync Active ({drive_folder})" if wf_success else "Added to repos.txt (Sync pending)"
 
 
 
