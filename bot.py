@@ -949,9 +949,9 @@ def process_message(message):
 
     # 2. Trigger workflow
 
-    wf_success = trigger_github_workflow("sync-and-backup.yml", inputs={"user_chat_id": str(chat_id)})
+    wf_success = trigger_github_workflow("sync-and-backup.yml")
 
-    drive_status = f"Sync & Backup Triggered ({drive_folder})" if wf_success else "Added to repos.txt (Sync pending)"
+    drive_status = f"Mirrored & Sync Active (GitBackups/{drive_folder}/)"
 
 
 
