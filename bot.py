@@ -336,22 +336,32 @@ SHEET_LOCK = threading.Lock()
 
 
 def ensure_rclone_config():
-    conf_path = os.path.expanduser("~/.config/rclone/rclone.conf")
+    conf_path = "/tmp/rclone_bot.conf"
     if os.path.exists(conf_path) and os.path.getsize(conf_path) > 0:
-        return True
-    raw = os.getenv("RCLONE_CONFIG", "").strip()
+        return conf_path
+    raw = os.getenv("RCLONE_CONF_DATA", "").strip()
     if not raw:
-        return False
+        maybe_legacy = os.getenv("RCLONE_CONFIG", "").strip()
+        if "[gdrive]" in maybe_legacy:
+            raw = maybe_legacy
+        elif maybe_legacy and os.path.exists(maybe_legacy):
+            return maybe_legacy
+    if not raw:
+        return None
     if "[gdrive]" not in raw:
         try:
             raw = base64.b64decode(raw).decode("utf-8")
         except Exception:
             pass
-    os.makedirs(os.path.dirname(conf_path), exist_ok=True)
     with open(conf_path, "w", encoding="utf-8") as f:
         f.write(raw + "\n")
     os.chmod(conf_path, 0o600)
-    return True
+    return conf_path
+
+
+def _rclone_env():
+    # Strip RCLONE_CONFIG so rclone never treats INI content or stale env paths as config path
+    return {k: v for k, v in os.environ.items() if k != "RCLONE_CONFIG"}
 
 
 def _apply_sheet_styles(ws):
@@ -404,39 +414,55 @@ def _apply_sheet_styles(ws):
 
 
 def sync_sheet_via_rclone(repo_name, original_link, private_mirror, drive_status, action=None):
-    if not ensure_rclone_config():
+    conf_path = ensure_rclone_config()
+    if not conf_path:
         return None
+    env = _rclone_env()
     ist_now = (datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M")
     with SHEET_LOCK:
         tmp_dir = tempfile.mkdtemp(prefix="gsheet_")
         try:
-            dl = subprocess.run(["rclone", "copy", "gdrive:GitHub Repos Backup Hub.xlsx", tmp_dir], capture_output=True, text=True, timeout=45)
             xlsx_path = os.path.join(tmp_dir, "GitHub Repos Backup Hub.xlsx")
-            if dl.returncode != 0 or not os.path.exists(xlsx_path):
-                print(f"rclone sheet download failed: {dl.stderr[:200]}", flush=True)
+            dl_ok = False
+            for attempt in range(2):
+                dl = subprocess.run(["rclone", "--config", conf_path, "copy", "gdrive:GitHub Repos Backup Hub.xlsx", tmp_dir], env=env, capture_output=True, text=True, timeout=45)
+                if dl.returncode == 0 and os.path.exists(xlsx_path):
+                    dl_ok = True
+                    break
+                print(f"rclone sheet download attempt {attempt + 1} failed: {dl.stderr[:200]}", flush=True)
+                time.sleep(2)
+            if not dl_ok:
                 return None
 
             wb = openpyxl.load_workbook(xlsx_path)
             ws = wb.active
             clean_rows = []
             if action != "clean_all":
-                seen = set()
+                seen_names = set()
+                seen_urls = set()
                 target_idx = -1
+                norm_target_name = (repo_name or "").strip().lower()
+                norm_target_url = (original_link or "").strip().lower().rstrip("/").removesuffix(".git")
                 for r in range(2, ws.max_row + 1):
                     rn = str(ws.cell(r, 2).value or "").strip()
-                    if not rn or rn.lower() in seen:
-                        continue
-                    seen.add(rn.lower())
                     orig = str(ws.cell(r, 3).value or "").strip()
+                    if not rn or not orig:
+                        continue
+                    n_key = rn.lower()
+                    u_key = orig.lower().rstrip("/").removesuffix(".git")
+                    if n_key in seen_names or u_key in seen_urls:
+                        continue
+                    seen_names.add(n_key)
+                    seen_urls.add(u_key)
                     mir = str(ws.cell(r, 4).value or "").strip()
                     st = str(ws.cell(r, 5).value or "").strip()
                     dt_v = ws.cell(r, 6).value
                     dt_s = dt_v.strftime("%Y-%m-%d %H:%M") if isinstance(dt_v, datetime.datetime) else str(dt_v or "").strip()
-                    if rn.lower() == repo_name.strip().lower():
+                    if norm_target_name and (n_key == norm_target_name or (norm_target_url and u_key == norm_target_url)):
                         target_idx = len(clean_rows)
                     clean_rows.append([rn, orig, mir, st, dt_s])
 
-                if repo_name:
+                if repo_name and action != "reformat_only":
                     new_entry = [repo_name, original_link, private_mirror, drive_status, ist_now]
                     if target_idx >= 0:
                         clean_rows[target_idx] = new_entry
@@ -452,11 +478,13 @@ def sync_sheet_via_rclone(repo_name, original_link, private_mirror, drive_status
             _apply_sheet_styles(out_ws)
             out_wb.save(xlsx_path)
 
-            up = subprocess.run(["rclone", "copy", xlsx_path, "gdrive:", "--drive-import-formats", "xlsx"], capture_output=True, text=True, timeout=45)
-            if up.returncode == 0:
-                print(f"Formatted Google Sheet synced via rclone for {repo_name or action}!", flush=True)
-                return {"status": "success", "method": "rclone_xlsx"}
-            print(f"rclone sheet upload failed: {up.stderr[:200]}", flush=True)
+            for attempt in range(3):
+                up = subprocess.run(["rclone", "--config", conf_path, "copy", xlsx_path, "gdrive:", "--drive-import-formats", "xlsx"], env=env, capture_output=True, text=True, timeout=45)
+                if up.returncode == 0:
+                    print(f"Formatted Google Sheet synced via rclone ({len(clean_rows)} repos) for {repo_name or action}!", flush=True)
+                    return {"status": "success", "method": "rclone_xlsx", "rows": len(clean_rows) + 1}
+                print(f"rclone sheet upload attempt {attempt + 1} failed: {up.stderr[:200]}", flush=True)
+                time.sleep(2 * (attempt + 1))
             return None
         except Exception as e:
             print(f"sync_sheet_via_rclone error: {e}", flush=True)
@@ -1191,6 +1219,18 @@ class WebhookHandler(BaseHTTPRequestHandler):
             else:
 
                 self.wfile.write(json.dumps({"sync": False}).encode('utf-8'))
+
+        elif self.path == "/format-sheet":
+
+            res = sync_sheet_via_rclone("", "", "", "", action="reformat_only")
+
+            self.send_response(200 if res else 500)
+
+            self.send_header('Content-type', 'application/json')
+
+            self.end_headers()
+
+            self.wfile.write(json.dumps(res or {"status": "error"}).encode('utf-8'))
 
         else:
 
